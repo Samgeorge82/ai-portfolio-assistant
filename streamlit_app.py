@@ -13,7 +13,7 @@ from langchain_community.tools.tavily_search import TavilySearchResults
 os.environ["OPENAI_API_KEY"] = st.secrets["OPENAI_API_KEY"]
 os.environ["TAVILY_API_KEY"] = st.secrets["TAVILY_API_KEY"]
 
-llm = OpenAI()
+llm = OpenAI(model_name="gpt-4o", temperature=0.3)
 
 st.set_page_config(page_title="AI Portfolio Assistant")
 st.title("⚡ AI Portfolio Assistant")
