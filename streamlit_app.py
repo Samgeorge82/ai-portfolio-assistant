@@ -9,38 +9,38 @@ from langchain.llms import OpenAI
 from langchain.chains import RetrievalQA
 from langchain_community.tools.tavily_search import TavilySearchResults
 
-# Load API keys from Streamlit secrets
+# Set API keys from Streamlit secrets
 os.environ["OPENAI_API_KEY"] = st.secrets["OPENAI_API_KEY"]
 os.environ["TAVILY_API_KEY"] = st.secrets["TAVILY_API_KEY"]
 
-# Initialize LLM once
 llm = OpenAI()
 
-# UI
 st.set_page_config(page_title="AI Portfolio Assistant")
 st.title("⚡ AI Portfolio Assistant")
-st.markdown("Upload your offshore wind portfolio and ask smart questions. The assistant will search the web if needed.")
+st.markdown("Upload your offshore wind portfolio and ask smart questions. The assistant will search the web if needed and match risks/opportunities to your project list.")
 
 uploaded_file = st.file_uploader("Upload your Excel (.xlsx)", type=["xlsx"])
 question = st.text_input("Ask a portfolio-related question:")
 
 if uploaded_file and question:
-    # Read and format Excel
+    # Read the Excel file
     df = pd.read_excel(uploaded_file)
+
+    # Turn Excel rows into LangChain documents
     documents = [
         Document(page_content="\n".join([f"{col}: {row[col]}" for col in df.columns]))
         for _, row in df.iterrows()
     ]
 
-    # Embed and build retriever
+    # Create vector store
     embeddings = OpenAIEmbeddings()
     db = FAISS.from_documents(documents, embeddings)
     retriever = db.as_retriever(search_kwargs={"k": 20})
     qa = RetrievalQA.from_chain_type(llm=llm, retriever=retriever)
 
-    # Step 1: Decide if web search is needed
+    # Step 1: Decide if a web search is needed
     planning_prompt = f"""
-You are an assistant. Decide if this question requires web search.
+You are an assistant. Decide if this question requires web search. Always focus on offshore wind energy context.
 
 Question: {question}
 
@@ -53,6 +53,9 @@ Return 'YES: [search query]' or 'NO'.
     external_context = ""
     if planning_response.upper().startswith("YES"):
         search_query = planning_response.split(":", 1)[1].strip()
+        if "offshore wind" not in search_query.lower():
+            search_query += " offshore wind"
+
         search = TavilySearchResults(k=5)
         results = search.run(search_query)
 
@@ -63,19 +66,35 @@ Return 'YES: [search query]' or 'NO'.
             external_context = "No relevant external news found."
             st.markdown("⚠️ No useful news found in web search.")
 
-    # Step 3: Get internal data insight
+    # Step 3: Run internal QA
     internal_answer = qa.run(question)
 
-    # Step 4: Combine and reason
-    final_prompt = f"""
-You are an AI assistant for an offshore wind portfolio analyst. 
-You have access to internal project data and real-time external policy/news updates.
+    # Step 4: Match affected projects by checking country/region terms in question
+    affected_projects = []
+    for _, row in df.iterrows():
+        row_text = " ".join([str(val).lower() for val in row.values])
+        if any(
+            word in question.lower()
+            for word in [str(row.get("Country", "")).lower(), str(row.get("Region", "")).lower()]
+        ):
+            affected_projects.append(row["Name"])
 
-Your job is to:
-- Answer the user's question with clear reasoning
-- Use relevant internal data
-- Use external market news if available
-- Suggest potential risks, opportunities, or next steps
+    matched_summary = ", ".join(affected_projects) if affected_projects else "None identified"
+
+    # Step 5: Final answer reasoning
+    final_prompt = f"""
+You are an AI assistant for an offshore wind portfolio analyst.
+
+You have:
+1. Internal project data (queried insights)
+2. Real-time market/policy news
+3. A matched list of potentially affected projects
+
+Your job:
+- Answer the user's question clearly
+- Use insights from both internal data and external news
+- Mention matched project names if relevant
+- Finish with a 🔔 Suggested Actions section (bullet points)
 
 ---
 
@@ -85,15 +104,18 @@ Your job is to:
 📰 External News Insight:
 {external_context}
 
+📍 Potentially Affected Projects:
+{matched_summary}
+
 ❓ User Question:
 {question}
 
 ---
 
-💡 Now provide a clear, strategic answer:
+💡 Strategic Answer:
 """
     final_response = llm.invoke(final_prompt)
 
-    # Step 5: Display result
+    # Display answer
     st.markdown("### 💡 Assistant's Suggestion")
     st.write(final_response)
