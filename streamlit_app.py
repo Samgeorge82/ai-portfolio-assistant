@@ -64,8 +64,9 @@ Return 'YES: [search query]' or 'NO'.
 
         if results:
             external_context = "\n".join([r["content"] for r in results])
-            sources_display = "\n".join([f"- [{r['title']}]({r['url']})" for r in results])
-            sources_list = "\n".join([r["url"] for r in results])
+            sources_display = "\n".join([f"- [{r.get('title', 'Untitled')}]({r.get('url', '#')})" for r in results if r.get("url")])
+            sources_list = "\n".join([r["url"] for r in results if r.get("url")])
+
 
             st.markdown("✅ **Web search results retrieved**")
             st.markdown("#### 🔗 Sources")
