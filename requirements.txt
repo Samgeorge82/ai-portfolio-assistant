@@ -5,4 +5,4 @@ faiss-cpu
 langchain
 langchain-community
 tavily-python
-
+openpyxl
