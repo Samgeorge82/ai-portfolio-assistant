@@ -1,6 +1,7 @@
-streamlit
-langchain
+langchain==0.1.14
+langchain-community==0.0.21
 openai
 faiss-cpu
 pandas
+streamlit
 tavily-python
