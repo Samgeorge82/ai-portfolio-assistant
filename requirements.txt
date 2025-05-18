@@ -2,7 +2,8 @@ streamlit
 pandas
 openai
 faiss-cpu
-langchain
-langchain-community
+langchain==0.1.14
+langchain-community==0.0.21
 tavily-python
 openpyxl
+
