@@ -3,6 +3,7 @@ pandas
 openai
 faiss-cpu
 langchain==0.1.14
-langchain-community==0.0.21
+langchain-community==0.0.30
 tavily-python
 openpyxl
+
