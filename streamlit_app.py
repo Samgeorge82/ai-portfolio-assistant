@@ -3,11 +3,11 @@ import pandas as pd
 import os
 
 from langchain.docstore.document import Document
-from langchain.embeddings import OpenAIEmbeddings
+from langchain_community.embeddings import OpenAIEmbeddings
 from langchain_community.vectorstores import FAISS
 from langchain.llms import OpenAI
 from langchain.chains import RetrievalQA
-from langchain.tools.tavily_search import TavilySearchResults
+from langchain_community.tools.tavily_search import TavilySearchResults
 
 # Set API keys from Streamlit secrets
 os.environ["OPENAI_API_KEY"] = st.secrets["OPENAI_API_KEY"]
