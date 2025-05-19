@@ -13,7 +13,7 @@ from langchain.chat_models import ChatOpenAI  # ✅ Correct model class
 os.environ["OPENAI_API_KEY"] = st.secrets["OPENAI_API_KEY"]
 os.environ["TAVILY_API_KEY"] = st.secrets["TAVILY_API_KEY"]
 
-llm = ChatOpenAI(model_name="gpt-4o", temperature=0.3)  # ✅ Use OpenAI Chat API
+llm = ChatOpenAI(model_name="gpt-4o", temperature=0.3)
 
 st.set_page_config(page_title="AI Portfolio Assistant")
 st.title("⚡ AI Portfolio Assistant")
@@ -32,15 +32,16 @@ if uploaded_file and question:
         for _, row in df.iterrows()
     ]
 
-    # Set up vector store and retriever
+    # Set up vector store and retriever with higher recall
     embeddings = OpenAIEmbeddings()
     db = FAISS.from_documents(documents, embeddings)
-    retriever = db.as_retriever(search_kwargs={"k": 20})
+    retriever = db.as_retriever(search_kwargs={"k": 50})
     qa = RetrievalQA.from_chain_type(llm=llm, retriever=retriever)
 
     # Step 1: Decide if web search is needed
     planning_prompt = f"""
-You are an assistant. Decide if this question requires web search. Always focus on offshore wind energy context.
+You are an assistant. Decide if this question requires web search. 
+Always focus on offshore wind energy context and ensure the search targets **recent news from 2024 or 2025**.
 
 Question: {question}
 
@@ -58,15 +59,20 @@ Return 'YES: [search query]' or 'NO'.
         search_query = planning_response.split(":", 1)[1].strip()
         if "offshore wind" not in search_query.lower():
             search_query += " offshore wind"
+        search_query += " 2024 2025"
 
         search = TavilySearchResults(k=5)
         results = search.run(search_query)
 
         if results:
             external_context = "\n".join([r["content"] for r in results])
-            sources_display = "\n".join([f"- [{r.get('title', 'Untitled')}]({r.get('url', '#')})" for r in results if r.get("url")])
-            sources_list = "\n".join([r["url"] for r in results if r.get("url")])
-
+            sources_display = "\n".join([
+                f"- [{r.get('title', 'Untitled')}]({r.get('url', '#')})"
+                for r in results if r.get("url")
+            ])
+            sources_list = "\n".join([
+                r["url"] for r in results if r.get("url")
+            ])
 
             st.markdown("✅ **Web search results retrieved**")
             st.markdown("#### 🔗 Sources")
@@ -83,9 +89,12 @@ Return 'YES: [search query]' or 'NO'.
     for _, row in df.iterrows():
         if any(
             word in question.lower()
-            for word in [str(row.get("Country", "")).lower(), str(row.get("Region", "")).lower()]
+            for word in [
+                str(row.get("Country", "")).lower(),
+                str(row.get("Region", "")).lower()
+            ]
         ):
-            affected_projects.append(str(row["Name"]))
+            affected_projects.append(str(row.get("Name", "Unnamed Project")))
 
     matched_summary = ", ".join(affected_projects) if affected_projects else "None identified"
 
@@ -103,7 +112,8 @@ Your job:
 - Use insights from internal data and external news
 - Mention specific affected projects if relevant
 - End with a 🔔 Suggested Actions section (bulleted)
-- If useful, cite the provided URLs
+- Cite any relevant URLs if useful
+- Prioritize **recent updates from 2024 or 2025** and ignore outdated news
 
 ---
 
@@ -126,7 +136,6 @@ Your job:
 
 💡 Strategic Answer:
 """
-
     final_response = llm.invoke(final_prompt).content
 
     # Display response
