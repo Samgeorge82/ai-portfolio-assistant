@@ -1,231 +1,299 @@
-import streamlit as st
-import pandas as pd
+# streamlit_app.py
+# Unified app: Excel Q&A with LLM + Web Search  ➜  PLUS Scenario "Steel price ↑ → Capex impact"
+# - Robust column mapping UI (works with any sheet naming)
+# - Safe numeric coercion (€, commas, 'MEUR' suffixes, etc.)
+# - FAISS vectorstore memoized per-file (no Streamlit cache errors)
+# - No dependency on 'tabulate' (uses CSV/JSON for LLM context)
+
 import os
 import re
-from datetime import datetime
+import json
+import hashlib
+from typing import List, Dict, Any, Tuple
 
-from langchain.docstore.document import Document
-from langchain_community.embeddings import OpenAIEmbeddings
+import streamlit as st
+import pandas as pd
+import numpy as np
+
+# ===================== Defensive LangChain/OpenAI imports =====================
+try:
+    from langchain_openai import ChatOpenAI, OpenAIEmbeddings  # modern packages
+    _LC_MODE = "modern"
+except ModuleNotFoundError:
+    # fallbacks for older envs
+    from langchain.chat_models import ChatOpenAI
+    from langchain_community.embeddings import OpenAIEmbeddings
+    _LC_MODE = "legacy"
+
+from langchain_community.docstore.document import Document
 from langchain_community.vectorstores import FAISS
 from langchain.chains import RetrievalQA
-from langchain_community.tools.tavily_search import TavilySearchResults
-from langchain_openai import ChatOpenAI  # Updated import
 
-# -------------------------------
-# SETUP
-# -------------------------------
-os.environ["OPENAI_API_KEY"] = st.secrets["OPENAI_API_KEY"]
-os.environ["TAVILY_API_KEY"] = st.secrets["TAVILY_API_KEY"]
+try:
+    from langchain_community.tools.tavily_search import TavilySearchResults
+    _HAS_TAVILY = True
+except Exception:
+    _HAS_TAVILY = False
 
-llm = ChatOpenAI(model="gpt-4o", temperature=0.3)
+# ===================== App config & keys =====================
+st.set_page_config(page_title="⚡ Ask DGX — AI Portfolio Assistant", layout="wide")
+st.title("⚡ Ask DGX — AI Portfolio Assistant")
+st.caption("Grounded Q&A over your Excel + optional web context. Now with a scenario engine (e.g., “Steel +10% → extra capex by year”).")
 
-st.set_page_config(page_title="AI Portfolio Assistant")
-st.title("⚡ AI Portfolio Assistant")
-st.markdown("""
-Upload your offshore wind portfolio and ask strategic questions.  
-The assistant will check your project data, search the web if needed,  
-and match findings to affected projects.
-""")
+OPENAI_KEY = st.secrets.get("OPENAI_API_KEY", os.getenv("OPENAI_API_KEY", ""))
+TAVILY_KEY = st.secrets.get("TAVILY_API_KEY", os.getenv("TAVILY_API_KEY", ""))
 
-# -------------------------------
-# FILE UPLOAD + QUESTION INPUT
-# -------------------------------
-uploaded_file = st.file_uploader("Upload your Excel (.xlsx)", type=["xlsx"])
-question = st.text_input("Ask a portfolio-related question:")
+if OPENAI_KEY:
+    os.environ["OPENAI_API_KEY"] = OPENAI_KEY
+if TAVILY_KEY:
+    os.environ["TAVILY_API_KEY"] = TAVILY_KEY
 
-# -------------------------------
-# SCENARIO HANDLER
-# -------------------------------
-def detect_steel_price_scenario(q):
-    return "steel" in q.lower() and "price" in q.lower()
+def make_llm(model_pref="gpt-4o-mini", temperature=0.1):
+    kwargs = {"temperature": temperature}
+    if _LC_MODE == "modern":
+        kwargs["model"] = model_pref
+    else:
+        kwargs["model_name"] = "gpt-4o"
+    return ChatOpenAI(**kwargs)
 
-def extract_percentage(q):
-    match = re.search(r"(\d+(\.\d+)?)\s*%", q)
-    if match:
-        return float(match.group(1))
+llm = make_llm("gpt-4o-mini", 0.1)
+judge_llm = make_llm("gpt-4o-mini", 0.0)
+emb = OpenAIEmbeddings()
+
+# ===================== Inputs =====================
+uploaded_file = st.file_uploader("Upload Excel (.xlsx)", type=["xlsx"])
+question = st.text_input("Ask a portfolio-related question (e.g., 'projects in construction with COD > 2030' or 'If steel +10%, extra capex 2028–2031?')")
+
+# ===================== Helpers =====================
+@st.cache_data(show_spinner=False)
+def read_excel_bytes(b: bytes) -> pd.DataFrame:
+    return pd.read_excel(b)
+
+def file_sha256(b: bytes) -> str:
+    return hashlib.sha256(b).hexdigest()
+
+def money_to_float(series: pd.Series) -> pd.Series:
+    x = series.astype(str)
+    x = x.str.replace(r"[€,\s]", "", regex=True)
+    x = x.str.replace(r"(?i)(meur|eur|m|mn)$", "", regex=True)
+    return pd.to_numeric(x, errors="coerce")
+
+def guess_col(df: pd.DataFrame, candidates: List[str]) -> str | None:
+    cols = list(df.columns)
+    norm = {c.lower().strip(): c for c in cols}
+    for cand in candidates:
+        if cand.lower().strip() in norm:
+            return norm[cand.lower().strip()]
+    for c in cols:
+        lc = c.lower()
+        if any(cand.lower() in lc for cand in candidates):
+            return c
     return None
 
-def extract_year_range(q):
-    years = re.findall(r"(20\d{2})", q)
-    years = [int(y) for y in years]
-    if len(years) >= 2:
-        return min(years), max(years)
-    elif len(years) == 1:
-        return years[0], years[0]
-    else:
-        return None, None
+def detect_steel_price_scenario(q: str) -> bool:
+    ql = q.lower()
+    return ("steel" in ql or "stahl" in ql) and ("price" in ql or "preis" in ql or "%" in ql) and ("capex" in ql or "cost" in ql or "kosten" in ql)
 
-def calculate_steel_impact(df, pct_increase, start_year, end_year):
-    # Define default steel exposure factors
-    weights = {
-        "Foundations Capex": 1.0,
-        "WTG Capex": 0.25,
-        "OSS Capex": 0.5
-    }
+def extract_percentage(q: str) -> float | None:
+    m = re.search(r"(\d+(?:\.\d+)?)\s*%", q)
+    return float(m.group(1)) if m else None
 
-    # Ensure date column
-    if not pd.api.types.is_datetime64_any_dtype(df["COD Target"]):
-        df["COD Target"] = pd.to_datetime(df["COD Target"], errors="coerce")
+def extract_year_range(q: str) -> Tuple[int | None, int | None]:
+    yrs = [int(y) for y in re.findall(r"(20\d{2})", q)]
+    if len(yrs) >= 2:
+        return min(yrs), max(yrs)
+    elif len(yrs) == 1:
+        return yrs[0], yrs[0]
+    return None, None
 
-    # Filter by year range
-    filtered = df[(df["COD Target"].dt.year >= start_year) &
-                  (df["COD Target"].dt.year <= end_year)]
+def llm_should_search(q: str) -> str:
+    plan = f"""You are a planner. Decide if this portfolio question needs recent external web search.
+Return exactly 'NO' or 'YES: <query>'. Only say YES for offshore-wind news/policy/supply updates from 2024–2025.
+Question: {q}"""
+    try:
+        return judge_llm.invoke(plan).content.strip()
+    except Exception:
+        return "NO"
 
-    results = []
-    for _, row in filtered.iterrows():
-        extra_cost = 0
-        for col, weight in weights.items():
-            if col in row and pd.notnull(row[col]):
-                extra_cost += row[col] * weight * (pct_increase / 100)
-        results.append({
-            "Project": row.get("Project Name", ""),
-            "COD Year": row["COD Target"].year if pd.notnull(row["COD Target"]) else None,
-            "Extra Capex (€m)": round(extra_cost, 2)
-        })
-    return pd.DataFrame(results)
+# ===================== Main =====================
+if uploaded_file:
+    file_bytes = uploaded_file.getvalue()
+    df = read_excel_bytes(file_bytes)
 
-# -------------------------------
-# MAIN LOGIC
-# -------------------------------
-if uploaded_file and question:
-    df = pd.read_excel(uploaded_file)
+    # ---------- Column mapping UI (works with any sheet) ----------
+    st.markdown("### 🧭 Map key columns")
+    c1, c2, c3, c4 = st.columns(4)
+    name_guess = guess_col(df, ["project name","name","asset"])
+    cod_guess  = guess_col(df, ["cod target","cod","commercial operation date","cod date"])
+    country_guess = guess_col(df, ["country","market","region"])
 
-    # Scenario detection: steel price increase
-    if detect_steel_price_scenario(question):
-        pct_increase = extract_percentage(question)
-        start_year, end_year = extract_year_range(question)
-        if pct_increase and start_year:
-            scenario_df = calculate_steel_impact(df, pct_increase, start_year, end_year)
-            st.subheader("📊 Scenario Result")
-            st.dataframe(scenario_df)
+    name_col = c1.selectbox("Project Name", options=df.columns, index=(df.columns.get_loc(name_guess) if name_guess in df.columns else 0))
+    cod_col  = c2.selectbox("COD Target (date)", options=df.columns, index=(df.columns.get_loc(cod_guess) if cod_guess in df.columns else 0))
+    country_col = c3.selectbox("Country/Market (optional)", options=["<none>"]+list(df.columns),
+                               index=(0 if not country_guess else 1+df.columns.get_loc(country_guess)))
+    id_col = c4.selectbox("Project ID (optional)", options=["<none>"]+list(df.columns),
+                          index=(0 if not guess_col(df,["project id","id"]) else 1+df.columns.get_loc(guess_col(df,["project id","id"]))))
 
-            # Send to LLM for reasoning output
-            llm_context = f"""
-User Question: {question}
-Here is the calculated extra capex per project:
-{scenario_df.to_markdown(index=False)}
+    st.markdown("#### Capex buckets (MEUR) — map if available")
+    b1, b2, b3, b4, b5 = st.columns(5)
+    wtg_col = b1.selectbox("WTG", options=["<none>"]+list(df.columns), index=(0 if not guess_col(df,["wtg capex","turbine capex"]) else 1+df.columns.get_loc(guess_col(df,["wtg capex","turbine capex"]))))
+    fnd_col = b2.selectbox("Foundations", options=["<none>"]+list(df.columns), index=(0 if not guess_col(df,["foundations capex","foundation capex","monopile","jacket"]) else 1+df.columns.get_loc(guess_col(df,["foundations capex","foundation capex","monopile","jacket"])))) 
+    oss_col = b3.selectbox("OSS", options=["<none>"]+list(df.columns), index=(0 if not guess_col(df,["oss capex","substation capex","offshore substation"]) else 1+df.columns.get_loc(guess_col(df,["oss capex","substation capex","offshore substation"]))))
+    arr_col = b4.selectbox("Array", options=["<none>"]+list(df.columns), index=(0 if not guess_col(df,["array cable capex","inter-array capex"]) else 1+df.columns.get_loc(guess_col(df,["array cable capex","inter-array capex"]))))
+    exp_col = b5.selectbox("Export", options=["<none>"]+list(df.columns), index=(0 if not guess_col(df,["export system capex","export cable capex","grid connection capex"]) else 1+df.columns.get_loc(guess_col(df,["export system capex","export cable capex","grid connection capex"]))))
 
-Write a clear, concise analysis of the financial impact, highlight the biggest affected projects,
-and suggest mitigation actions.
-"""
-            final_response = llm.invoke(llm_context).content
-            st.markdown("### 💡 Assistant's Analysis")
-            st.write(final_response)
+    # Normalize types
+    work = df.copy()
+    work[cod_col] = pd.to_datetime(work[cod_col], errors="coerce")
+    def col_or_none(sel): return None if sel == "<none>" else sel
+    for lbl, sel in [("WTG", wtg_col), ("Foundations", fnd_col), ("OSS", oss_col), ("Array", arr_col), ("Export", exp_col)]:
+        dst = f"{lbl} Capex (MEUR)"
+        if col_or_none(sel):
+            work[dst] = money_to_float(work[sel]).fillna(0.0)
         else:
-            st.warning("Couldn't parse percentage or year range from your question.")
-    else:
-        # -------------------------------
-        # Normal LLM + FAISS + Tavily flow
-        # -------------------------------
-        documents = [
-            Document(page_content="\n".join([f"{col}: {row[col]}" for col in df.columns]))
-            for _, row in df.iterrows()
-        ]
-        embeddings = OpenAIEmbeddings()
-        db = FAISS.from_documents(documents, embeddings)
-        retriever = db.as_retriever(search_kwargs={"k": 50})
+            work[dst] = 0.0
+
+    with st.expander("🔎 Capex mapping debug"):
+        dbg = []
+        for lbl in ["WTG","Foundations","OSS","Array","Export"]:
+            s = work[f"{lbl} Capex (MEUR)"]
+            dbg.append({"Bucket": lbl, "Non-zero rows": int((s > 0).sum()), "Sum (MEUR)": round(float(s.sum()),1)})
+        st.dataframe(pd.DataFrame(dbg))
+
+    # ===================== Scenario branch (Steel price → extra capex) =====================
+    handled_scenario = False
+    if question:
+        if detect_steel_price_scenario(question):
+            handled_scenario = True
+            pct = extract_percentage(question) or 10.0
+            y0, y1 = extract_year_range(question)
+            work["COD Year"] = work[cod_col].dt.year
+
+            # Default exposure weights (tweak live if you want)
+            st.markdown("### ⚙️ Steel exposure weights (tunable)")
+            s1,s2,s3,s4,s5 = st.columns(5)
+            w_wtg = s1.slider("WTG", 0.0, 1.0, 0.25, 0.05)
+            w_fnd = s2.slider("Foundations", 0.0, 1.0, 1.00, 0.05)
+            w_oss = s3.slider("OSS", 0.0, 1.0, 0.50, 0.05)
+            w_arr = s4.slider("Array", 0.0, 1.0, 0.15, 0.05)
+            w_exp = s5.slider("Export", 0.0, 1.0, 0.15, 0.05)
+
+            exposure = (
+                work["Foundations Capex (MEUR)"] * w_fnd +
+                work["WTG Capex (MEUR)"]         * w_wtg +
+                work["OSS Capex (MEUR)"]         * w_oss +
+                work["Array Capex (MEUR)"]       * w_arr +
+                work["Export Capex (MEUR)"]      * w_exp
+            )
+            work["Extra Capex (MEUR)"] = (exposure * (pct / 100.0)).round(1)
+
+            out_cols = [name_col, "COD Year", "Extra Capex (MEUR)"]
+            if id_col != "<none>": out_cols = [id_col] + out_cols
+            scenario_df = work[out_cols].copy()
+
+            if y0:
+                scenario_df = scenario_df[(scenario_df["COD Year"] >= y0) & (scenario_df["COD Year"] <= y1)]
+
+            st.markdown("### 📊 Scenario Result — Steel price shock")
+            st.dataframe(scenario_df, use_container_width=True)
+
+            # Year aggregation
+            st.markdown("#### 📈 Extra capex by year (MEUR)")
+            year_sum = scenario_df.groupby("COD Year", dropna=True, as_index=False)["Extra Capex (MEUR)"].sum()
+            st.dataframe(year_sum, use_container_width=True)
+
+            # LLM analysis (send CSV, not markdown)
+            llm_context = f"""User Question: {question}
+Steel price increase: {pct}%
+Exposure weights used: WTG={w_wtg}, Foundations={w_fnd}, OSS={w_oss}, Array={w_arr}, Export={w_exp}
+Per-project impact (CSV):
+{scenario_df.to_csv(index=False)}
+Per-year totals (CSV):
+{year_sum.to_csv(index=False)}
+Write a concise analysis highlighting the biggest affected years/projects and 3–4 mitigation actions."""
+            analysis = llm.invoke(llm_context).content
+            st.markdown("### 💡 Assistant’s Analysis")
+            st.write(analysis)
+
+    # ===================== Default Q&A branch (LLM + FAISS + optional web) =====================
+    if question and not handled_scenario:
+        # Vectorstore memoized per file (no caching of unhashable objects)
+        key = file_sha256(file_bytes)
+        if "vs_cache" not in st.session_state:
+            st.session_state.vs_cache = {}
+        if key not in st.session_state.vs_cache:
+            with st.spinner("Indexing your data for semantic Q&A…"):
+                docs: List[Document] = []
+                for _, row in df.iterrows():
+                    pairs = [f"{col}: {str(row[col])}" for col in df.columns]
+                    docs.append(Document(page_content="\n".join(pairs)))
+                vs = FAISS.from_documents(docs, emb)
+                st.session_state.vs_cache[key] = vs
+        else:
+            vs = st.session_state.vs_cache[key]
+
+        retriever = vs.as_retriever(search_kwargs={"k": 50})
         qa = RetrievalQA.from_chain_type(llm=llm, retriever=retriever)
 
-        # Step 1: Decide if web search is needed
-        planning_prompt = f"""
-You are an assistant. Decide if this question requires web search. 
-Always focus on offshore wind energy context and ensure the search targets **recent news from 2024 or 2025**.
+        # Planner: should we web search?
+        plan = llm_should_search(question)
+        st.markdown(f"**🧠 Planning:** `{plan}`")
+        external_context, sources_display, sources_list = "", "", ""
 
-Question: {question}
-
-Return 'YES: [search query]' or 'NO'.
-"""
-        planning_response = llm.invoke(planning_prompt).content.strip()
-        st.markdown(f"**🧠 Planning Response:** `{planning_response}`")
-
-        external_context = ""
-        sources_display = ""
-        sources_list = ""
-
-        # Step 2: Run Tavily web search if needed
-        if planning_response.upper().startswith("YES"):
-            search_query = planning_response.split(":", 1)[1].strip()
+        if plan.upper().startswith("YES") and _HAS_TAVILY and TAVILY_KEY:
+            search_query = plan.split(":", 1)[1].strip()
             if "offshore wind" not in search_query.lower():
                 search_query += " offshore wind"
             search_query += " 2024 2025"
+            try:
+                search = TavilySearchResults(k=5)
+                results = search.run(search_query)
+                if results:
+                    external_context = "\n".join([(r.get("content") or "") for r in results])
+                    sources_display = "\n".join([f"- [{r.get('title','Untitled')}]({r.get('url','#')})" for r in results if r.get("url")])
+                    sources_list = "\n".join([r["url"] for r in results if r.get("url")])
+                    st.markdown("✅ **Web results retrieved**")
+                    st.markdown("#### 🔗 Sources")
+                    st.markdown(sources_display)
+            except Exception:
+                st.info("Web search not available right now.")
 
-            search = TavilySearchResults(k=5)
-            results = search.run(search_query)
-
-            if results:
-                external_context = "\n".join([r["content"] for r in results])
-                sources_display = "\n".join([
-                    f"- [{r.get('title', 'Untitled')}]({r.get('url', '#')})"
-                    for r in results if r.get("url")
-                ])
-                sources_list = "\n".join([
-                    r["url"] for r in results if r.get("url")
-                ])
-
-                st.markdown("✅ **Web search results retrieved**")
-                st.markdown("#### 🔗 Sources")
-                st.markdown(sources_display)
-            else:
-                external_context = "No relevant external news found."
-                st.markdown("⚠️ No useful news found in web search.")
-
-        # Step 3: Answer using internal project data
+        # Internal answer
         internal_answer = qa.run(question)
 
-        # Step 4: Match potentially affected projects
-        affected_projects = []
-        for _, row in df.iterrows():
-            if any(
-                word in question.lower()
-                for word in [
-                    str(row.get("Country", "")).lower(),
-                    str(row.get("Region", "")).lower()
-                ]
-            ):
-                affected_projects.append(str(row.get("Name", "Unnamed Project")))
+        # Lightweight affected-projects guess (by country term match)
+        affected = []
+        ql = question.lower()
+        if country_col != "<none>":
+            for _, r in df.iterrows():
+                if str(r[country_col]).lower() in ql:
+                    affected.append(str(r[name_col]))
+        matched_summary = ", ".join(affected) if affected else "None identified"
 
-        matched_summary = ", ".join(affected_projects) if affected_projects else "None identified"
+        final_prompt = f"""You are an assistant for an offshore wind portfolio analyst.
 
-        # Step 5: Final reasoning prompt
-        final_prompt = f"""
-You are an AI assistant for an offshore wind portfolio analyst.
+Use ONLY the provided internal summary and optional web context. Be concise, factual, and add a short 🔔 Suggested Actions list.
 
-You have:
-1. Internal project data (queried insights)
-2. Real-time market/policy news
-3. A matched list of potentially affected projects
-
-Your job:
-- Answer the user's question clearly
-- Use insights from internal data and external news
-- Mention specific affected projects if relevant
-- End with a 🔔 Suggested Actions section (bulleted)
-- Cite any relevant URLs if useful
-- Prioritize **recent updates from 2024 or 2025** and ignore outdated news
-
----
-
-📊 Internal Portfolio Insight:
+Internal summary:
 {internal_answer}
 
-📰 External News Insight:
+External context (if any, may be empty):
 {external_context}
 
-🔗 Sources:
+Sources (URLs, if any):
 {sources_list}
 
-📍 Potentially Affected Projects:
+Potentially affected projects (quick guess):
 {matched_summary}
 
-❓ User Question:
+User question:
 {question}
 
----
-
-💡 Strategic Answer:
+Now write the final answer:
 """
         final_response = llm.invoke(final_prompt).content
-
-        # Display response
-        st.markdown("### 💡 Assistant's Suggestion")
+        st.markdown("### 💡 Assistant’s Suggestion")
         st.write(final_response)
+
+else:
+    st.info("Upload an Excel and ask a question to begin.")
