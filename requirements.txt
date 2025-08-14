@@ -1,9 +1,12 @@
-streamlit
+streamlit>=1.36
 pandas
-openai
-faiss-cpu
-langchain==0.1.14
-langchain-community==0.0.30
-tavily-python
 openpyxl
+tiktoken
+faiss-cpu
+tavily-python
+openai>=1.40.0
 
+# LangChain v0.2 line (new import paths)
+langchain==0.2.14
+langchain-community==0.2.12
+langchain-openai==0.1.23
