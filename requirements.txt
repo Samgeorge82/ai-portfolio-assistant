@@ -10,3 +10,4 @@ openai>=1.40.0
 langchain==0.2.14
 langchain-community==0.2.12
 langchain-openai==0.1.23
+tabulate
