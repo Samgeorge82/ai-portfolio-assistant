@@ -1,325 +1,410 @@
 # streamlit_app.py
 import os
+import re
 import json
 import hashlib
-from typing import List, Dict
+from typing import List, Dict, Any, Tuple
 
 import streamlit as st
 import pandas as pd
+import numpy as np
 
-# -------------------- Robust imports (works with modern & legacy LC) --------------------
-# Try modern "langchain-openai"; fall back to legacy paths if not installed.
+# ===================== Robust OpenAI / LangChain imports =====================
+# Works with both modern and older LangChain installs.
 try:
-    from langchain_openai import ChatOpenAI, OpenAIEmbeddings  # modern package
-    _LC_OPENAI_MODE = "modern"
+    from langchain_openai import ChatOpenAI  # modern
+    _LC_MODE = "modern"
 except ModuleNotFoundError:
-    from langchain.chat_models import ChatOpenAI                 # legacy
-    from langchain_community.embeddings import OpenAIEmbeddings
-    _LC_OPENAI_MODE = "legacy"
+    from langchain.chat_models import ChatOpenAI  # legacy
+    _LC_MODE = "legacy"
 
-# Common LC bits (versions differ; guard optional retrievers below)
-from langchain_community.docstore.document import Document
-from langchain_community.vectorstores import FAISS
-from langchain.text_splitter import RecursiveCharacterTextSplitter
-
-# Optional retriever enhancements (available on LC 0.2+)
-try:
-    from langchain.retrievers.multi_query import MultiQueryRetriever
-    from langchain.retrievers.document_compressors import LLMChainFilter
-    from langchain.retrievers import ContextualCompressionRetriever
-    _HAS_MQR = True
-except Exception:
-    _HAS_MQR = False
-
-# Prompting / chaining (APIs changed across versions; keep usage simple)
-try:
-    from langchain.prompts import PromptTemplate
-    from langchain.schema.runnable import RunnablePassthrough
-    _HAS_RUNNABLE = True
-except Exception:
-    _HAS_RUNNABLE = False
-
-# Tavily search (optional)
-try:
-    from langchain_community.tools.tavily_search import TavilySearchResults
-    _HAS_TAVILY = True
-except Exception:
-    _HAS_TAVILY = False
-
-# -------------------- App config --------------------
+# ===================== App config =====================
 st.set_page_config(page_title="Ask DGX — AI Portfolio Assistant", layout="wide")
 st.title("⚡ Ask DGX — AI Portfolio Assistant")
-st.caption(
-    "Grounded Q&A over your DGX export. Searches **your data first** and only adds "
-    "**2024–2025 offshore-wind** news if the question actually needs it."
-)
+st.caption("Structured filters first (numbers/dates/text), then optional LLM synthesis. No more ‘imaginary’ capacities.")
 
-# -------------------- Secrets / keys --------------------
-# (Works locally and on Streamlit Cloud if you set them in Secrets)
+# ===================== Secrets / keys =====================
 OPENAI_KEY = st.secrets.get("OPENAI_API_KEY", os.getenv("OPENAI_API_KEY", ""))
-TAVILY_KEY = st.secrets.get("TAVILY_API_KEY", os.getenv("TAVILY_API_KEY", ""))
-
 if OPENAI_KEY:
     os.environ["OPENAI_API_KEY"] = OPENAI_KEY
-if TAVILY_KEY:
-    os.environ["TAVILY_API_KEY"] = TAVILY_KEY
 
-# -------------------- LLM helpers --------------------
-def make_chat_llm(model_pref: str = "gpt-4o-mini", temperature: float = 0.1):
-    """
-    Create a ChatOpenAI instance that works across modern/legacy LC.
-    Modern constructor: ChatOpenAI(model="gpt-4o-mini")
-    Legacy constructor: ChatOpenAI(model_name="gpt-4o", temperature=...)
-    """
+def make_llm(model_pref: str = "gpt-4o-mini", temperature: float = 0.0):
     kwargs = {"temperature": temperature}
-    # Modern uses "model"; legacy uses "model_name".
-    if _LC_OPENAI_MODE == "modern":
+    if _LC_MODE == "modern":
         kwargs["model"] = model_pref
     else:
-        # Legacy lib may not know "gpt-4o-mini"; degrade gracefully.
         kwargs["model_name"] = "gpt-4o"
     return ChatOpenAI(**kwargs)
 
-def make_embeddings(model_pref: str = "text-embedding-3-large"):
-    if _LC_OPENAI_MODE == "modern":
-        return OpenAIEmbeddings(model=model_pref)
-    else:
-        # Legacy embeddings ignore model kwarg; still fine.
-        return OpenAIEmbeddings()
+judge_llm = make_llm("gpt-4o-mini", 0.0)
+writer_llm = make_llm("gpt-4o-mini", 0.1)
 
-llm = make_chat_llm("gpt-4o-mini", temperature=0.1)
-judge_llm = make_chat_llm("gpt-4o-mini", temperature=0.0)
-emb = make_embeddings("text-embedding-3-large")
-
-# -------------------- UI --------------------
+# ===================== UI =====================
 uploaded_file = st.file_uploader("Upload Excel (.xlsx)", type=["xlsx"])
-question = st.text_input("Ask a portfolio-related question")
+question = st.text_input("Ask a portfolio-related question (e.g., 'projects in construction with total installed capacity > 6000 MW')")
 
-with st.expander("Optional: map your columns"):
-    name_col = st.text_input("Project Name column", value="Name")
-    country_col = st.text_input("Country column", value="Country")
-    region_col = st.text_input("Region/Market column", value="Region")
+with st.expander("Optional: map key columns (auto-detect tries its best)"):
+    user_name_col = st.text_input("Project Name column (optional)", value="")
+    user_status_col = st.text_input("Project Status/Phase column (optional)", value="")
+    user_country_col = st.text_input("Country/Market column (optional)", value="")
 
-# -------------------- Utility functions --------------------
+# ===================== Helpers =====================
+@st.cache_data(show_spinner=False)
+def read_excel_bytes(b: bytes) -> pd.DataFrame:
+    return pd.read_excel(b)
+
 def file_sha256(b: bytes) -> str:
     return hashlib.sha256(b).hexdigest()
 
-@st.cache_data(show_spinner=False)
-def read_excel_bytes(b: bytes) -> pd.DataFrame:
-    # Keep it simple; openpyxl must be installed
-    return pd.read_excel(b)
+def normalize_col(s: str) -> str:
+    return re.sub(r"\s+", " ", s.strip().lower())
 
-def df_to_documents(df: pd.DataFrame) -> List[Document]:
-    """Chunk each row into ~1.2k char docs for better retrieval."""
-    splitter = RecursiveCharacterTextSplitter(chunk_size=1200, chunk_overlap=100)
-    docs: List[Document] = []
-    for i, row in df.iterrows():
-        pairs = [f"{col}: {str(row[col])}" for col in df.columns]
-        row_text = "\n".join(pairs)
-        for chunk in splitter.split_text(row_text):
-            docs.append(Document(page_content=chunk, metadata={"row_index": int(i)}))
-    return docs
-
-def build_retriever(vs: FAISS):
-    """Use MultiQuery + compression if available; else fall back to base retriever."""
-    base = vs.as_retriever(search_kwargs={"k": 8})
-    if _HAS_MQR:
-        try:
-            mq = MultiQueryRetriever.from_llm(retriever=base, llm=judge_llm)
-            compressor = LLMChainFilter.from_llm(judge_llm)
-            return ContextualCompressionRetriever(base_compressor=compressor, base_retriever=mq)
-        except Exception:
-            return base
-    return base
-
-def extract_entities_for_matching(q: str) -> List[str]:
-    """Cheap NER-ish pass using the judge model. Falls back to simple tokenization."""
-    prompt = """Extract proper nouns and location terms from the question as a JSON array of lowercased strings.
-Only include single or two-word terms. No commentary.
-
-Question: {q}
-JSON:"""
-    try:
-        out = judge_llm.invoke(prompt.format(q=q)).content.strip()
-        arr = json.loads(out)
-        if isinstance(arr, list):
-            return [str(x).lower() for x in arr]
-    except Exception:
-        pass
-    # Fallback: crude tokens
-    return [w.strip().lower() for w in q.replace(",", " ").split() if len(w) > 3]
-
-def decide_search(q: str) -> str:
-    """Return '' or a focused offshore-wind query string for 2024–2025."""
-    plan = """You are a planner. Decide if the question needs **recent external context**.
-Return exactly 'NO' or 'YES: <query>'.
-
-Rules:
-- Only say YES if answer likely depends on news/policy/market info from 2024 or 2025.
-- Scope strictly to **offshore wind**.
-- Prefer specific terms (country, OEM, auction name, cable maker, CfD round, etc.).
-
-Question: {q}
-"""
-    try:
-        resp = judge_llm.invoke(plan.format(q=q)).content.strip()
-    except Exception:
-        return ""
-    if resp.upper().startswith("YES"):
-        query = resp.split(":", 1)[1].strip()
-        if "offshore wind" not in query.lower():
-            query += " offshore wind"
-        query += " 2024 2025"
-        return query
+def guess_column(df: pd.DataFrame, candidates: List[str]) -> str:
+    cols = list(df.columns)
+    norm_map = {normalize_col(c): c for c in cols}
+    for cand in candidates:
+        if cand in norm_map:  # exact normalized hit
+            return norm_map[cand]
+    # fuzzy contains
+    for c in cols:
+        cn = normalize_col(c)
+        if any(cand in cn for cand in candidates):
+            return c
     return ""
 
-def run_tavily(query: str, k: int = 5) -> List[Dict]:
-    """Query Tavily if available; return normalized results list."""
-    if not query or not _HAS_TAVILY or not TAVILY_KEY:
-        return []
+def coerce_numeric(series: pd.Series) -> pd.Series:
+    # Strip commas, MW suffixes, whitespace; convert to float
+    s = series.astype(str).str.replace(",", "", regex=False)
+    s = s.str.replace(r"\s*mw\s*$", "", regex=True, flags=re.I)
+    s = s.str.strip()
+    return pd.to_numeric(s, errors="coerce")
+
+def coerce_date(series: pd.Series) -> pd.Series:
+    return pd.to_datetime(series, errors="coerce", utc=False, dayfirst=False)
+
+def list_columns_with_types(df: pd.DataFrame, sample_rows: int = 200) -> Dict[str, str]:
+    """
+    Infer coarse types: 'number', 'date', 'text' by sampling.
+    """
+    info = {}
+    sample = df.head(sample_rows)
+    for c in df.columns:
+        # try number
+        num_try = pd.to_numeric(sample[c], errors="coerce")
+        num_ratio = num_try.notna().mean()
+        # try date
+        date_try = pd.to_datetime(sample[c], errors="coerce")
+        date_ratio = date_try.notna().mean()
+        if num_ratio >= 0.8:
+            info[c] = "number"
+        elif date_ratio >= 0.8:
+            info[c] = "date"
+        else:
+            info[c] = "text"
+    return info
+
+# ===================== Structured filter extraction =====================
+SUPPORTED_OPS = {
+    "equals": "==",
+    "==": "==",
+    "=": "==",
+    "!=": "!=",
+    "not equals": "!=",
+    ">": ">",
+    ">=": ">=",
+    "<": "<",
+    "<=": "<=",
+    "contains": "contains",        # text only
+    "icontains": "icontains",      # text only (case-insensitive)
+    "in": "in",                    # text/enum
+    "between": "between",          # numeric/date ranges
+}
+
+def build_schema_prompt(df: pd.DataFrame) -> str:
+    types = list_columns_with_types(df)
+    lines = [f"- {c} ({t})" for c, t in types.items()]
+    return "\n".join(lines)
+
+def parse_filters_with_llm(q: str, df: pd.DataFrame) -> Dict[str, Any]:
+    """
+    Ask the model to emit structured filters in a strict JSON schema.
+    """
+    schema = build_schema_prompt(df)
+    prompt = f"""
+You convert natural-language portfolio questions into structured filters for a pandas DataFrame.
+
+Columns (with inferred types):
+{schema}
+
+Supported operators (choose correctly by type):
+- number/date: ==, !=, >, >=, <, <=, between
+- text: equals (==), !=, contains, icontains, in
+
+Return STRICT JSON with this shape (no prose, no markdown):
+{{
+  "filters": [
+    {{"column": "<exact column name>", "operator": "<one of {list(SUPPORTED_OPS.keys())}>", "value": <value or [min,max] for between>}},
+    ...
+  ],
+  "select": ["<optional columns to display>"]
+}}
+
+Rules:
+- Normalize synonyms: "construction", "under construction" → match exactly what's in the data if possible.
+- If units like "MW" appear, strip units and use numbers only.
+- If a column name is ambiguous, pick the most likely from Columns list.
+- If no explicit filters in the question, return {{"filters": [], "select": []}}.
+
+Question: {q}
+JSON:
+"""
     try:
-        search = TavilySearchResults(k=k)
-        res = search.run(query)
-        cleaned, seen = [], set()
-        for r in res or []:
-            url = r.get("url")
-            if not url or url in seen:
-                continue
-            seen.add(url)
-            cleaned.append({
-                "title": r.get("title", "Untitled"),
-                "url": url,
-                "content": (r.get("content") or "")[:2000],  # trim token bloat
-            })
-        return cleaned
+        out = judge_llm.invoke(prompt).content.strip()
+        obj = json.loads(out)
+        if "filters" not in obj:
+            obj["filters"] = []
+        if "select" not in obj:
+            obj["select"] = []
+        return obj
     except Exception:
-        return []
+        return {"filters": [], "select": []}
 
-def format_sources_md(rows: List[Dict]) -> str:
-    if not rows:
-        return "None"
-    return "\n".join(f"- [{r.get('title','Source')}]({r.get('url','#')})" for r in rows)
+def apply_single_filter(df: pd.DataFrame, f: Dict[str, Any]) -> pd.Series:
+    col = f.get("column", "")
+    op = (f.get("operator", "") or "").lower()
+    val = f.get("value", None)
+    if col not in df.columns or op not in SUPPORTED_OPS:
+        return pd.Series([True]*len(df))  # ignore bad filter
 
-def match_affected_projects(df: pd.DataFrame, entities: List[str], name_col: str, country_col: str, region_col: str) -> List[str]:
-    names: List[str] = []
-    for _, row in df.iterrows():
-        fields = " ".join([
-            str(row.get(name_col, "")).lower(),
-            str(row.get(country_col, "")).lower(),
-            str(row.get(region_col, "")).lower(),
-        ])
-        if any(e and e in fields for e in entities):
-            nm = str(row.get(name_col, "") or "Unnamed Project")
-            if nm:
-                names.append(nm)
-    # de-dupe, preserve order
-    deduped = list(dict.fromkeys(names).keys())
-    return deduped
+    # Infer column type again for safety
+    types = list_columns_with_types(df)
+    ctype = types.get(col, "text")
 
-def combine_docs_text(docs: List[Document]) -> str:
-    return "\n\n".join(d.page_content for d in docs)
+    if ctype == "number":
+        series = coerce_numeric(df[col])
+        if op in {"==", "!=","<", "<=", ">", ">="}:
+            try:
+                v = float(val)
+            except Exception:
+                return pd.Series([True]*len(df))
+            expr = {
+                "==": series == v,
+                "!=": series != v,
+                "<": series < v,
+                "<=": series <= v,
+                ">": series > v,
+                ">=": series >= v,
+            }[op]
+            return expr.fillna(False)
+        elif op == "between":
+            try:
+                lo, hi = float(val[0]), float(val[1])
+            except Exception:
+                return pd.Series([True]*len(df))
+            return series.between(lo, hi, inclusive="both").fillna(False)
+        elif op in {"contains", "icontains", "in"}:
+            # not sensible for numeric; ignore
+            return pd.Series([True]*len(df))
+        else:
+            return pd.Series([True]*len(df))
 
-# -------------------- Main flow --------------------
+    if ctype == "date":
+        series = coerce_date(df[col])
+        if isinstance(val, list) and op == "between":
+            try:
+                lo = pd.to_datetime(val[0], errors="coerce")
+                hi = pd.to_datetime(val[1], errors="coerce")
+            except Exception:
+                return pd.Series([True]*len(df))
+            return series.between(lo, hi, inclusive="both").fillna(False)
+        else:
+            # normalize val to datetime for comparisons
+            v = pd.to_datetime(val, errors="coerce")
+            if pd.isna(v):
+                return pd.Series([True]*len(df))
+            if op == "==":
+                return (series.dt.date == v.date()).fillna(False)
+            if op == "!=":
+                return (series.dt.date != v.date()).fillna(False)
+            if op == ">":
+                return (series > v).fillna(False)
+            if op == ">=":
+                return (series >= v).fillna(False)
+            if op == "<":
+                return (series < v).fillna(False)
+            if op == "<=":
+                return (series <= v).fillna(False)
+            if op == "between" and isinstance(val, list):
+                # covered above
+                return pd.Series([True]*len(df))
+            return pd.Series([True]*len(df))
+
+    # text
+    series = df[col].astype(str)
+    if op in {"==", "equals"}:
+        return (series.str.lower().str.strip() == str(val).lower().strip())
+    if op in {"!=", "not equals"}:
+        return (series.str.lower().str.strip() != str(val).lower().strip())
+    if op == "contains":
+        return series.str.contains(str(val), case=True, na=False)
+    if op == "icontains":
+        return series.str.contains(str(val), case=False, na=False)
+    if op == "in":
+        try:
+            vals = [str(x).lower().strip() for x in (val if isinstance(val, list) else [val])]
+        except Exception:
+            vals = [str(val).lower().strip()]
+        return series.str.lower().str.strip().isin(vals)
+    # between for text not supported
+    return pd.Series([True]*len(df))
+
+def apply_filters(df: pd.DataFrame, filters: List[Dict[str, Any]]) -> pd.DataFrame:
+    if not filters:
+        return df
+    mask = pd.Series([True]*len(df))
+    for f in filters:
+        mask = mask & apply_single_filter(df, f)
+    return df[mask]
+
+def pretty_number(x) -> str:
+    try:
+        f = float(x)
+        if np.isnan(f):
+            return ""
+        return f"{f:,.0f}"
+    except Exception:
+        return str(x)
+
+# ===================== Main logic =====================
 if uploaded_file and question:
-    # 1) Read uploaded file bytes (bytes are hashable and cache-friendly)
+    # Read and memoize DF (bytes are hashable)
     file_bytes = uploaded_file.getvalue()
     df = read_excel_bytes(file_bytes)
 
-    # 2) Build & memoize the vectorstore per file hash (avoid caching unhashables)
-    file_key = file_sha256(file_bytes)
-    if "vs_cache" not in st.session_state:
-        st.session_state.vs_cache = {}
+    # Try to auto-map key columns unless user provided
+    status_col_guess = guess_column(df, [
+        "status", "project status", "phase", "project phase", "construction status"
+    ])
+    name_col_guess = guess_column(df, ["name", "project name", "project", "asset name"])
+    country_col_guess = guess_column(df, ["country", "market", "region"])
 
-    if file_key not in st.session_state.vs_cache:
-        with st.spinner("Indexing your data…"):
-            docs = df_to_documents(df)
-            vs = FAISS.from_documents(docs, emb)
-            st.session_state.vs_cache[file_key] = vs
+    name_col = user_name_col or name_col_guess or (df.columns[0] if len(df.columns) else "")
+    status_col = user_status_col or status_col_guess
+    country_col = user_country_col or country_col_guess
+
+    with st.expander("Detected schema & types"):
+        types = list_columns_with_types(df)
+        st.write(pd.DataFrame({"column": list(types.keys()), "type": list(types.values())}))
+
+    # 1) Extract structured filters from the question
+    parsed = parse_filters_with_llm(question, df)
+    st.markdown("#### 🧠 Parsed filters")
+    st.code(json.dumps(parsed, indent=2))
+
+    # 2) Apply filters in Pandas (numbers/dates/text handled explicitly)
+    df_filtered = apply_filters(df, parsed.get("filters", []))
+
+    # If the user asked something like "in construction with total installed capacity > 6000",
+    # this will now be deterministic and correct, no LLM guessing.
+
+    # 3) Display results table first (truth source)
+    if df_filtered.empty:
+        st.warning("No rows match the filters. Try relaxing constraints or check column naming.")
     else:
-        vs = st.session_state.vs_cache[file_key]
+        # If they filtered on capacity, format any column that looks like capacity
+        cap_like = [c for c in df_filtered.columns if re.search(r"capacity|mw|kw|gw", c, re.I)]
+        df_show = df_filtered.copy()
+        for c in cap_like:
+            # attempt numeric pretty print without losing original
+            nums = coerce_numeric(df_show[c])
+            mask = nums.notna()
+            df_show.loc[mask, c] = nums[mask].apply(pretty_number)
 
-    retriever = build_retriever(vs)
+        # Display only selected columns if provided
+        sel = parsed.get("select", [])
+        if sel:
+            sel = [c for c in sel if c in df_show.columns]
+            if sel:
+                df_show = df_show[sel]
 
-    # 3) Internal grounded answer (keep it strict; no speculation)
-    internal_context_docs = retriever.get_relevant_documents(question)
-    internal_context = combine_docs_text(internal_context_docs) if internal_context_docs else ""
+        st.markdown("### 📊 Matching rows (ground truth)")
+        st.dataframe(df_show, use_container_width=True)
 
-    base_answer_prompt = (
-        "You are a cautious offshore wind portfolio analyst. "
-        "Answer ONLY using the provided internal context. "
-        "If the context is insufficient, state what is missing.\n\n"
-        f"Question:\n{question}\n\n"
-        f"Internal Context:\n{internal_context}\n\n"
-        "Return a concise, factual answer (no speculation)."
-    )
-    internal_answer = llm.invoke(base_answer_prompt).content.strip()
+    # 4) Optional LLM synthesis over the filtered subset (small sample to avoid token bloat)
+    want_summary = st.toggle("Generate LLM summary (optional)", value=True)
+    if want_summary and not df_filtered.empty:
+        # build a compact, typed summary of the filtered rows
+        MAX_ROWS = 40  # cap to keep prompt manageable
+        sample = df_filtered.head(MAX_ROWS)
 
-    # 4) Decide if web context is needed; run Tavily if so
-    search_query = decide_search(question)
-    external_rows = run_tavily(search_query) if search_query else []
-    external_context = "\n\n".join(r["content"] for r in external_rows)[:6000]
-    sources_md = format_sources_md(external_rows)
-    sources_plain = "\n".join(r["url"] for r in external_rows) if external_rows else ""
+        # Identify likely key fields for summary
+        likely_name = name_col or guess_column(df, ["name", "project name"])
+        likely_status = status_col or guess_column(df, ["status", "phase"])
+        # pick a likely capacity column
+        cap_col_guess = guess_column(df, [
+            "total installed capacity (mw)",
+            "total capacity (mw)",
+            "capacity (mw)",
+            "installed capacity",
+            "capacity"
+        ])
 
-    # 5) Match affected projects using cheap NER terms
-    entities = extract_entities_for_matching(question)
-    affected = match_affected_projects(df, entities, name_col, country_col, region_col)
-    affected_summary = ", ".join(affected) if affected else "None"
+        # Build a safe, typed JSON payload for the LLM
+        def safe_val(v):
+            if pd.isna(v):
+                return None
+            if isinstance(v, (np.floating, float, int, np.integer)):
+                return float(v)
+            return str(v)
 
-    # 6) Final structured response
-    final_prompt = f"""
-You are an AI assistant for an offshore wind portfolio analyst. Synthesize a grounded answer.
+        rows_payload = []
+        for _, r in sample.iterrows():
+            item = {}
+            for c in df.columns:
+                item[c] = safe_val(r[c])
+            rows_payload.append(item)
 
-You have:
-- Internal DGX-derived context (already curated above)
-- External curated news (optional, 2024–2025 only)
-- A list of potentially affected projects
+        prompt = f"""
+You are summarizing filtered offshore wind portfolio rows. Be precise and concise.
+- Do NOT invent numbers; only reference values present in the JSON rows.
+- Prefer these fields if present: Name: "{likely_name}", Status: "{likely_status}", Capacity: "{cap_col_guess}".
+- If capacity appears, treat it as MW (number).
+- If totals are asked, compute from the rows provided only.
 
-Write a response with EXACTLY these sections:
-
-### Answer
-- Clear, 5–8 lines max. Cite fields or figures only if seen in internal context. If you reference news, add (see Sources).
-
-### Affected projects
-- Brief sentence + a bullet list. If none, say "None".
-
-### Suggested actions 🔔
-- 3–5 bullets, each starting with a strong verb, concrete and assignable.
-- If context is weak, first bullet should be "Validate data" with what to validate.
-
-### Sources
-- If external sources exist, render the list (already markdown formatted). If none, write "None".
-
-Internal Context (grounded answer from retrieval):
-{internal_answer}
-
-External News (optional, summarized snippets):
-{external_context}
-
-Potentially Affected Projects:
-{affected_summary}
-
-User Question:
+User question:
 {question}
 
-Sources (plain):
-{sources_plain}
+Rows (JSON, up to {MAX_ROWS} rows):
+{json.dumps(rows_payload)[:18000]}
+
+Write:
+1) A clear 5–8 line answer grounded in the data.
+2) A short bullet list of the matching projects with Name, Status, and Capacity (if available).
+3) A 'Suggested actions 🔔' 3–5 bullets (validate any ambiguous fields, next steps).
 """
-    final = llm.invoke(final_prompt).content
+        llm_answer = writer_llm.invoke(prompt).content
+        st.markdown("### 💡 Assistant’s summary (grounded in the table above)")
+        st.write(llm_answer)
 
-    # 7) Display
-    st.markdown("### 💡 Assistant’s Suggestion")
-    st.write(final)
-
-    with st.expander("🔗 Sources (clickable)"):
-        st.markdown(sources_md)
-
-    with st.expander("🧪 Debug"):
-        st.code(f"Planner query: {search_query or 'NO'}")
-        st.code(f"Entities: {entities}")
-        st.code(f"Affected: {affected_summary}")
-        st.code(f"LC mode: {_LC_OPENAI_MODE} | Has MQR: {_HAS_MQR} | Has Runnable: {_HAS_RUNNABLE} | Has Tavily: {_HAS_TAVILY}")
+    # 5) Quick query templates (quality-of-life)
+    with st.expander("🔎 Quick templates"):
+        st.caption("Click to append:")
+        cols = st.columns(3)
+        if cols[0].button("Construction & capacity > 6000 MW"):
+            st.session_state["q"] = "Which projects are in construction with total installed capacity > 6000 MW?"
+        if cols[1].button("COD between 2028 and 2031"):
+            st.session_state["q"] = "List projects with COD between 2028-01-01 and 2031-12-31."
+        if cols[2].button("Country contains Germany & risk icontains high"):
+            st.session_state["q"] = "Show projects where Country contains Germany and Risk icontains high."
 
 else:
     st.info("Upload an Excel and ask a question to begin.")
 
+# ===================== Notes =====================
+# - This app FIRST applies Pandas filters inferred from natural language:
+#   • numeric (>, >=, <, <=, ==, !=, between)
+#   • date (same operators + between)
+#   • text (equals/!=/contains/icontains/in)
+# - That stops the LLM from making up capacities or IDs.
+# - Then, optionally, the LLM writes a readable summary based only on the filtered subset.
+# - If a filter column/operator is ambiguous, the parser picks the most likely from your sheet’s schema.
